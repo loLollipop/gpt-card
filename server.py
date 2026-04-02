@@ -3,6 +3,7 @@ import uuid
 import time
 import json
 import os
+import threading
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -33,8 +34,11 @@ from checkout import (
 
 app = FastAPI(title="Stripe Protocol Checkout API")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MANUAL_HANDOFF_TTL_SECONDS = 15 * 60
+MANUAL_HANDOFF_TTL_SECONDS = int(os.getenv("MANUAL_HANDOFF_TTL_SECONDS", str(15 * 60)))
+APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
+APP_PORT = int(os.getenv("APP_PORT", "8888"))
 manual_handoff_store: Dict[str, Dict[str, Any]] = {}
+manual_handoff_lock = threading.Lock()
 
 # ==========================================
 # 1. 定义 API 请求的数据模型 (Pydantic)
@@ -96,26 +100,28 @@ def fetch_publishable_key_pure(session: requests.Session, session_id: str, manua
 
 def _cleanup_expired_handoffs() -> None:
     now = int(time.time())
-    expired_keys = [
-        handoff_id
-        for handoff_id, item in manual_handoff_store.items()
-        if now - item.get("created_at", now) > MANUAL_HANDOFF_TTL_SECONDS
-    ]
-    for handoff_id in expired_keys:
-        manual_handoff_store.pop(handoff_id, None)
+    with manual_handoff_lock:
+        expired_keys = [
+            handoff_id
+            for handoff_id, item in manual_handoff_store.items()
+            if now - item.get("created_at", now) > MANUAL_HANDOFF_TTL_SECONDS
+        ]
+        for handoff_id in expired_keys:
+            manual_handoff_store.pop(handoff_id, None)
 
 
 def _build_manual_handoff(req: CheckoutRequest, session_id: str, hcaptcha_cfg: Dict[str, Any], reason: str) -> Dict[str, Any]:
     _cleanup_expired_handoffs()
     handoff_id = uuid.uuid4().hex
     created_at = int(time.time())
-    manual_handoff_store[handoff_id] = {
-        "created_at": created_at,
-        "session_id": session_id,
-        "checkout_request": req.model_dump(),
-        "hcaptcha_config": hcaptcha_cfg,
-        "reason": reason,
-    }
+    with manual_handoff_lock:
+        manual_handoff_store[handoff_id] = {
+            "created_at": created_at,
+            "session_id": session_id,
+            "checkout_request": req.model_dump(),
+            "hcaptcha_config": hcaptcha_cfg,
+            "reason": reason,
+        }
     return {
         "handoff_id": handoff_id,
         "session_id": session_id,
@@ -226,6 +232,11 @@ async def ui_home():
     return FileResponse(os.path.join(BASE_DIR, "ui.html"))
 
 
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok", "ts": int(time.time())}
+
+
 @app.post("/api/v1/checkout")
 async def process_checkout_endpoint(request: CheckoutRequest):
     """
@@ -250,7 +261,8 @@ async def process_checkout_endpoint(request: CheckoutRequest):
 async def complete_manual_handoff(request: ManualHandoffCompleteRequest):
     """人工完成 hCaptcha 后，回传 token 给服务端继续支付流程。"""
     _cleanup_expired_handoffs()
-    handoff = manual_handoff_store.get(request.handoff_id)
+    with manual_handoff_lock:
+        handoff = manual_handoff_store.get(request.handoff_id)
     if not handoff:
         raise HTTPException(status_code=404, detail="handoff_id 不存在或已过期，请重新发起 checkout")
     if not request.captcha_token.strip():
@@ -259,7 +271,8 @@ async def complete_manual_handoff(request: ManualHandoffCompleteRequest):
     checkout_payload = dict(handoff["checkout_request"])
     checkout_payload["captcha_token"] = request.captcha_token.strip()
     req = CheckoutRequest(**checkout_payload)
-    manual_handoff_store.pop(request.handoff_id, None)
+    with manual_handoff_lock:
+        manual_handoff_store.pop(request.handoff_id, None)
 
     result = await asyncio.to_thread(run_checkout_sync, req)
     if result["status"] == "error":
@@ -275,7 +288,8 @@ async def check_manual_handoff_status(request: ManualHandoffStatusRequest):
     - pending: 尚未完成，继续等待或使用 token 回传
     """
     _cleanup_expired_handoffs()
-    handoff = manual_handoff_store.get(request.handoff_id)
+    with manual_handoff_lock:
+        handoff = manual_handoff_store.get(request.handoff_id)
     if not handoff:
         raise HTTPException(status_code=404, detail="handoff_id 不存在或已过期，请重新发起 checkout")
 
@@ -286,7 +300,8 @@ async def check_manual_handoff_status(request: ManualHandoffStatusRequest):
             status_text = json.dumps(result, ensure_ascii=False).lower()
             success_keywords = ["succeeded", "complete", "paid", "success"]
             if any(keyword in status_text for keyword in success_keywords):
-                manual_handoff_store.pop(request.handoff_id, None)
+                with manual_handoff_lock:
+                    manual_handoff_store.pop(request.handoff_id, None)
                 return {"status": "completed", "data": result}
         return {"status": "pending", "message": "尚未检测到人工完成结果，请继续认证或稍后重试。"}
     except Exception as e:
@@ -295,4 +310,4 @@ async def check_manual_handoff_status(request: ManualHandoffStatusRequest):
 if __name__ == "__main__":
     import uvicorn
     # 启动命令: python server.py
-    uvicorn.run(app, host="0.0.0.0", port=8888)
+    uvicorn.run(app, host=APP_HOST, port=APP_PORT)
