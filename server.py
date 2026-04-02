@@ -2,8 +2,10 @@ import asyncio
 import uuid
 import time
 import json
+import os
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import requests
 
@@ -30,6 +32,7 @@ from checkout import (
 )
 
 app = FastAPI(title="Stripe Protocol Checkout API")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ==========================================
 # 1. 定义 API 请求的数据模型 (Pydantic)
@@ -143,6 +146,11 @@ def run_checkout_sync(req: CheckoutRequest) -> dict:
 # ==========================================
 # 4. Web 接口定义
 # ==========================================
+@app.get("/")
+async def ui_home():
+    return FileResponse(os.path.join(BASE_DIR, "ui.html"))
+
+
 @app.post("/api/v1/checkout")
 async def process_checkout_endpoint(request: CheckoutRequest):
     """
@@ -163,4 +171,4 @@ async def process_checkout_endpoint(request: CheckoutRequest):
 if __name__ == "__main__":
     import uvicorn
     # 启动命令: python server.py
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8888)

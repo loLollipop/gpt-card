@@ -1460,7 +1460,6 @@ def run(checkout_input: str, card_index: int = 0, config_path: str = "config.jso
     if hcaptcha_cfg.get("rqdata"):
         _log(f"      hCaptcha rqdata: {hcaptcha_cfg['rqdata'][:50]}...")
 
-   --
     send_telemetry_batch(http, session_id, init_ctx, phase="card_input")
 
     if manual_token:
