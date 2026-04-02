@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Checkout 控制台</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; background: #0f1724; color: #e6eeff; }
+    .container { max-width: 1040px; margin: 20px auto; padding: 0 14px 20px; }
+    .grid { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 14px; }
+    .card { background: #1b2535; border: 1px solid #32435f; border-radius: 12px; padding: 14px; }
+    h1 { margin: 0 0 12px; font-size: 24px; }
+    h2 { margin: 0 0 10px; font-size: 17px; }
+    label { display: block; margin: 8px 0 4px; color: #c8d3ea; font-size: 13px; }
+    input, textarea { width: 100%; box-sizing: border-box; border: 1px solid #3f506e; border-radius: 8px; padding: 8px; background: #0d1320; color: #eaf0ff; }
+    textarea { min-height: 70px; resize: vertical; }
+    .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .actions { display: flex; gap: 10px; margin-top: 14px; }
+    button { border: none; border-radius: 8px; padding: 10px 14px; cursor: pointer; font-weight: 600; }
+    .btn-primary { background: #3c82f6; color: white; }
+    .btn-secondary { background: #253248; color: #dce8ff; }
+    .hint { color: #93a5c7; font-size: 12px; margin-top: 4px; }
+    #logBox { background: #090d16; color: #9fe39f; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; min-height: 420px; max-height: 560px; overflow: auto; white-space: pre-wrap; border-radius: 8px; padding: 8px; }
+    details { margin-top: 12px; border: 1px dashed #3f506e; border-radius: 8px; padding: 10px; }
+    summary { cursor: pointer; color: #c8d3ea; }
+    @media (max-width: 960px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Stripe API 控制台（端口 8888）</h1>
+
+    <div class="grid">
+      <div class="card">
+        <h2>必填参数（其余自动处理）</h2>
+
+        <label>Checkout URL *</label>
+        <input id="checkout_url" placeholder="https://checkout.stripe.com/c/pay/cs_xxx" />
+
+        <h2 style="margin-top:14px;">卡信息 *</h2>
+        <div class="row2">
+          <div><label>Card Number</label><input id="card_number" value="4242424242424242" /></div>
+          <div><label>CVC</label><input id="card_cvc" value="123" /></div>
+          <div><label>Exp Month</label><input id="exp_month" value="12" /></div>
+          <div><label>Exp Year</label><input id="exp_year" value="2030" /></div>
+        </div>
+        <label>Name</label><input id="card_name" value="Test User" />
+        <label>Email</label><input id="card_email" value="test.user@example.com" />
+
+        <div class="row2">
+          <div><label>Address Line1</label><input id="line1" value="123 Test Street" /></div>
+          <div><label>Address Line2</label><input id="line2" value="Apt 8" /></div>
+          <div><label>City</label><input id="city" value="Shanghai" /></div>
+          <div><label>State</label><input id="state" value="Shanghai" /></div>
+          <div><label>Postal Code</label><input id="postal_code" value="200000" /></div>
+          <div><label>Country</label><input id="country" value="CN" /></div>
+        </div>
+
+        <details>
+          <summary>高级参数（可选，不填则脚本自动生成/默认）</summary>
+
+          <label>Publishable Key（留空自动探测）</label>
+          <input id="publishable_key" placeholder="pk_test_xxx" />
+
+          <label>Locale（留空默认 US）</label>
+          <input id="locale" placeholder="US" />
+
+          <label>Captcha Token（留空自动处理）</label>
+          <input id="captcha_token" placeholder="optional" />
+
+          <label>Captcha Config JSON（仅需要时填写）</label>
+          <textarea id="captcha_config" placeholder='{"api_url":"...","api_key":"..."}'></textarea>
+
+          <div class="row2">
+            <div><label>Proxy Host（可选）</label><input id="proxy_host" placeholder="127.0.0.1" /></div>
+            <div><label>Proxy Port（可选）</label><input id="proxy_port" placeholder="7890" /></div>
+            <div><label>Proxy User</label><input id="proxy_user" placeholder="optional" /></div>
+            <div><label>Proxy Password</label><input id="proxy_password" type="password" placeholder="optional" /></div>
+          </div>
+        </details>
+
+        <div class="actions">
+          <button class="btn-primary" id="btnSubmit">提交请求</button>
+          <button class="btn-secondary" id="btnClear">清空日志</button>
+        </div>
+        <div class="hint">提示：现在默认只需要输入 Checkout URL + 卡信息，其他参数留空即可。</div>
+      </div>
+
+      <div class="card">
+        <h2>日志窗口</h2>
+        <div id="logBox"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const logBox = document.getElementById('logBox');
+
+    function log(line) {
+      const ts = new Date().toLocaleString();
+      logBox.textContent += `[${ts}] ${line}\n`;
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    const getValue = (id) => document.getElementById(id).value.trim();
+
+    function buildPayload() {
+      const checkoutUrl = getValue('checkout_url');
+      if (!checkoutUrl) throw new Error('checkout_url 不能为空');
+
+      const payload = {
+        checkout_url: checkoutUrl,
+        card: {
+          number: getValue('card_number'),
+          exp_month: getValue('exp_month'),
+          exp_year: getValue('exp_year'),
+          cvc: getValue('card_cvc'),
+          name: getValue('card_name'),
+          email: getValue('card_email'),
+          address: {
+            line1: getValue('line1'),
+            line2: getValue('line2'),
+            city: getValue('city'),
+            state: getValue('state'),
+            postal_code: getValue('postal_code'),
+            country: getValue('country')
+          }
+        }
+      };
+
+      const publishableKey = getValue('publishable_key');
+      if (publishableKey) payload.publishable_key = publishableKey;
+
+      const locale = getValue('locale');
+      if (locale) payload.locale = locale;
+
+      const captchaToken = getValue('captcha_token');
+      if (captchaToken) payload.captcha_token = captchaToken;
+
+      const captchaConfigRaw = getValue('captcha_config');
+      if (captchaConfigRaw) payload.captcha_config = JSON.parse(captchaConfigRaw);
+
+      const proxyHost = getValue('proxy_host');
+      const proxyPort = getValue('proxy_port');
+      if (proxyHost && proxyPort) {
+        payload.proxy = {
+          host: proxyHost,
+          port: Number(proxyPort),
+          user: getValue('proxy_user'),
+          password: getValue('proxy_password')
+        };
+      }
+
+      return payload;
+    }
+
+    async function submitRequest() {
+      try {
+        const payload = buildPayload();
+        log(`Request -> ${JSON.stringify(payload, null, 2)}`);
+
+        const response = await fetch('/api/v1/checkout', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        const text = await response.text();
+        let body;
+        try { body = JSON.parse(text); } catch { body = text; }
+
+        log(`Response Status: ${response.status}`);
+        log(`Response Body: ${typeof body === 'string' ? body : JSON.stringify(body, null, 2)}`);
+      } catch (err) {
+        log(`Error: ${err.message}`);
+      }
+    }
+
+    document.getElementById('btnSubmit').addEventListener('click', submitRequest);
+    document.getElementById('btnClear').addEventListener('click', () => { logBox.textContent = ''; });
+
+    log('UI ready. 默认只需填写 checkout_url 和 card 字段。');
+  </script>
+</body>
+</html>
