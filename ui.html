@@ -20,6 +20,8 @@
     .btn-primary { background: #3c82f6; color: white; }
     .btn-secondary { background: #253248; color: #dce8ff; }
     .hint { color: #93a5c7; font-size: 12px; margin-top: 4px; }
+    .handoff-tip { margin-top: 10px; padding: 10px; border: 1px solid #4a5f84; border-radius: 8px; background: #111a2b; font-size: 12px; display: none; }
+    .handoff-tip a { color: #7fb1ff; word-break: break-all; }
     #logBox { background: #090d16; color: #9fe39f; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; min-height: 420px; max-height: 560px; overflow: auto; white-space: pre-wrap; border-radius: 8px; padding: 8px; }
     details { margin-top: 12px; border: 1px dashed #3f506e; border-radius: 8px; padding: 10px; }
     summary { cursor: pointer; color: #c8d3ea; }
@@ -84,17 +86,31 @@
           <button class="btn-secondary" id="btnClear">清空日志</button>
         </div>
         <div class="hint">提示：现在默认只需要输入 Checkout URL + 卡信息，其他参数留空即可。</div>
+
+        <details>
+          <summary>人工接管（当返回 manual_required 时使用）</summary>
+          <label>Handoff ID</label>
+          <input id="handoff_id" placeholder="服务器返回的 handoff_id" />
+          <label>Captcha Token</label>
+          <textarea id="manual_captcha_token" placeholder="人工验证成功后拿到的 token"></textarea>
+          <div class="actions">
+            <button class="btn-secondary" id="btnManualComplete">回传 Token 并继续</button>
+          </div>
+        </details>
       </div>
 
       <div class="card">
         <h2>日志窗口</h2>
         <div id="logBox"></div>
+        <div id="handoffTip" class="handoff-tip"></div>
       </div>
     </div>
   </div>
 
   <script>
     const logBox = document.getElementById('logBox');
+    const handoffTip = document.getElementById('handoffTip');
+    let handoffStatusTimer = null;
 
     function log(line) {
       const ts = new Date().toLocaleString();
@@ -171,13 +187,92 @@
 
         log(`Response Status: ${response.status}`);
         log(`Response Body: ${typeof body === 'string' ? body : JSON.stringify(body, null, 2)}`);
+        if (body && typeof body === 'object' && body.status === 'manual_required' && body.handoff?.handoff_id) {
+          document.getElementById('handoff_id').value = body.handoff.handoff_id;
+          const verifyUrl = body.handoff.manual_verify_url || '';
+          if (verifyUrl) {
+            handoffTip.style.display = 'block';
+            handoffTip.innerHTML = `
+              <div><strong>需要人工接管验证</strong></div>
+              <div>1) 点击下面链接打开 Stripe 页面并完成人机验证</div>
+              <div>2) 系统会每 5 秒自动检测是否已完成（你也可手动回传 token）</div>
+              <div>⚠️ 如果 Stripe 会话没有保留之前输入，可能仍会要求你补填部分信息，这是 Stripe 页面行为。</div>
+              <div style="margin-top:6px;"><a href="${verifyUrl}" target="_blank" rel="noopener noreferrer">${verifyUrl}</a></div>
+            `;
+            startHandoffStatusPolling(body.handoff.handoff_id);
+          }
+          log('检测到 manual_required，已自动填充 handoff_id，请完成人工验证后回传 token。');
+        }
       } catch (err) {
         log(`Error: ${err.message}`);
       }
     }
 
+    async function completeManualHandoff() {
+      try {
+        const handoffId = getValue('handoff_id');
+        const captchaToken = getValue('manual_captcha_token');
+        if (!handoffId) throw new Error('handoff_id 不能为空');
+        if (!captchaToken) throw new Error('captcha_token 不能为空');
+
+        const payload = { handoff_id: handoffId, captcha_token: captchaToken };
+        log(`Manual Handoff Request -> ${JSON.stringify(payload, null, 2)}`);
+
+        const response = await fetch('/api/v1/checkout/manual-handoff/complete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        const text = await response.text();
+        let body;
+        try { body = JSON.parse(text); } catch { body = text; }
+
+        log(`Manual Handoff Response Status: ${response.status}`);
+        log(`Manual Handoff Response Body: ${typeof body === 'string' ? body : JSON.stringify(body, null, 2)}`);
+      } catch (err) {
+        log(`Manual Handoff Error: ${err.message}`);
+      }
+    }
+
+    async function checkManualHandoffStatus(handoffId) {
+      const response = await fetch('/api/v1/checkout/manual-handoff/status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ handoff_id: handoffId })
+      });
+      const text = await response.text();
+      let body;
+      try { body = JSON.parse(text); } catch { body = text; }
+      return { response, body };
+    }
+
+    function startHandoffStatusPolling(handoffId) {
+      if (handoffStatusTimer) clearInterval(handoffStatusTimer);
+      handoffStatusTimer = setInterval(async () => {
+        try {
+          const { body } = await checkManualHandoffStatus(handoffId);
+          if (body && typeof body === 'object' && body.status === 'completed') {
+            log(`Manual Handoff Auto-Detected: ${JSON.stringify(body, null, 2)}`);
+            clearInterval(handoffStatusTimer);
+            handoffStatusTimer = null;
+            handoffTip.style.display = 'none';
+          }
+        } catch (err) {
+          log(`Manual Handoff Poll Error: ${err.message}`);
+        }
+      }, 5000);
+    }
+
     document.getElementById('btnSubmit').addEventListener('click', submitRequest);
-    document.getElementById('btnClear').addEventListener('click', () => { logBox.textContent = ''; });
+    document.getElementById('btnManualComplete').addEventListener('click', completeManualHandoff);
+    document.getElementById('btnClear').addEventListener('click', () => {
+      logBox.textContent = '';
+      if (handoffStatusTimer) clearInterval(handoffStatusTimer);
+      handoffStatusTimer = null;
+      handoffTip.style.display = 'none';
+      handoffTip.innerHTML = '';
+    });
 
     log('UI ready. 默认只需填写 checkout_url 和 card 字段。');
   </script>

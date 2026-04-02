@@ -33,6 +33,8 @@ from checkout import (
 
 app = FastAPI(title="Stripe Protocol Checkout API")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MANUAL_HANDOFF_TTL_SECONDS = 15 * 60
+manual_handoff_store: Dict[str, Dict[str, Any]] = {}
 
 # ==========================================
 # 1. 定义 API 请求的数据模型 (Pydantic)
@@ -61,6 +63,16 @@ class CheckoutRequest(BaseModel):
     captcha_config: Optional[Dict[str, str]] = None # 例如 {"api_url": "...", "api_key": "..."}
     locale: str = "US"
 
+
+class ManualHandoffCompleteRequest(BaseModel):
+    handoff_id: str
+    captcha_token: str
+    captcha_ekey: Optional[str] = ""
+
+
+class ManualHandoffStatusRequest(BaseModel):
+    handoff_id: str
+
 # ==========================================
 # 2. 改造 publishable_key 获取逻辑 (剔除 Playwright)
 # ==========================================
@@ -80,6 +92,60 @@ def fetch_publishable_key_pure(session: requests.Session, session_id: str, manua
             pass
 
     raise RuntimeError("无法通过纯协议探测到 publishable_key，请在请求参数中主动提供 publishable_key。")
+
+
+def _cleanup_expired_handoffs() -> None:
+    now = int(time.time())
+    expired_keys = [
+        handoff_id
+        for handoff_id, item in manual_handoff_store.items()
+        if now - item.get("created_at", now) > MANUAL_HANDOFF_TTL_SECONDS
+    ]
+    for handoff_id in expired_keys:
+        manual_handoff_store.pop(handoff_id, None)
+
+
+def _build_manual_handoff(req: CheckoutRequest, session_id: str, hcaptcha_cfg: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    _cleanup_expired_handoffs()
+    handoff_id = uuid.uuid4().hex
+    created_at = int(time.time())
+    manual_handoff_store[handoff_id] = {
+        "created_at": created_at,
+        "session_id": session_id,
+        "checkout_request": req.model_dump(),
+        "hcaptcha_config": hcaptcha_cfg,
+        "reason": reason,
+    }
+    return {
+        "handoff_id": handoff_id,
+        "session_id": session_id,
+        "reason": reason,
+        "expires_in_seconds": MANUAL_HANDOFF_TTL_SECONDS,
+        "manual_verify_url": req.checkout_url,
+        "hcaptcha": {
+            "site_key": hcaptcha_cfg.get("site_key", ""),
+            "rqdata": hcaptcha_cfg.get("rqdata", ""),
+        },
+    }
+
+
+def _check_handoff_payment_status(handoff: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    检查人工接管会话是否已经在 Stripe 页面被人工完成。
+    注意：这里只检查 checkout 结果，不依赖 captcha token 回传。
+    """
+    checkout_payload = handoff.get("checkout_request", {})
+    req = CheckoutRequest(**checkout_payload)
+    session_id, _ = parse_checkout_url(req.checkout_url)
+    http = requests.Session()
+    http.headers.update({"User-Agent": USER_AGENT})
+    if req.proxy:
+        proxy_url = f"http://{req.proxy.user}:{req.proxy.password}@{req.proxy.host}:{req.proxy.port}" if req.proxy.user else f"http://{req.proxy.host}:{req.proxy.port}"
+        http.proxies = {"http": proxy_url, "https": proxy_url}
+
+    pk = fetch_publishable_key_pure(http, session_id, manual_pk=req.publishable_key)
+    result = poll_result(http, pk, session_id, stripe_ver=STRIPE_VERSION_BASE)
+    return result
 
 # ==========================================
 # 3. 封装核心执行逻辑 (供线程池调用)
@@ -124,15 +190,24 @@ def run_checkout_sync(req: CheckoutRequest) -> dict:
             pm_id = create_payment_method(http, pk, req.card.model_dump(), req.captcha_token, session_id, stripe_ver, ctx=init_ctx)
             confirm_payment(http, pk, session_id, pm_id, req.captcha_token, init_resp, stripe_ver, req.captcha_config, ctx=init_ctx, locale_profile=locale_profile)
         else:
-            # 尝试无验证码提交，失败则调用 YesCaptcha API
+            # 尝试无验证码提交，失败则调用 YesCaptcha API；若不可用则切换人工接管
             try:
                 pm_id = create_payment_method(http, pk, req.card.model_dump(), "", session_id, stripe_ver, ctx=init_ctx)
                 confirm_payment(http, pk, session_id, pm_id, "", init_resp, stripe_ver, req.captcha_config, ctx=init_ctx, locale_profile=locale_profile)
             except RuntimeError as e:
                 if any(kw in str(e).lower() for kw in ["captcha", "hcaptcha"]):
-                    captcha_token, captcha_ekey = solve_hcaptcha(req.captcha_config, hcaptcha_cfg)
-                    pm_id = create_payment_method(http, pk, req.card.model_dump(), captcha_token, session_id, stripe_ver, ctx=init_ctx)
-                    confirm_payment(http, pk, session_id, pm_id, captcha_token, init_resp, stripe_ver, req.captcha_config, captcha_ekey=captcha_ekey, ctx=init_ctx, locale_profile=locale_profile)
+                    can_auto_solve = bool(req.captcha_config and req.captcha_config.get("api_key"))
+                    if can_auto_solve:
+                        try:
+                            captcha_token, captcha_ekey = solve_hcaptcha(req.captcha_config, hcaptcha_cfg)
+                            pm_id = create_payment_method(http, pk, req.card.model_dump(), captcha_token, session_id, stripe_ver, ctx=init_ctx)
+                            confirm_payment(http, pk, session_id, pm_id, captcha_token, init_resp, stripe_ver, req.captcha_config, captcha_ekey=captcha_ekey, ctx=init_ctx, locale_profile=locale_profile)
+                        except Exception as solve_err:
+                            handoff = _build_manual_handoff(req, session_id, hcaptcha_cfg, f"自动验证码服务失败: {solve_err}")
+                            return {"status": "manual_required", "message": "自动 hCaptcha 失败，已切换人工接管。", "handoff": handoff}
+                    else:
+                        handoff = _build_manual_handoff(req, session_id, hcaptcha_cfg, "缺少 captcha_token 且未配置自动验证码服务")
+                        return {"status": "manual_required", "message": "需要人工完成验证码后继续。", "handoff": handoff}
                 else:
                     raise
 
@@ -163,10 +238,59 @@ async def process_checkout_endpoint(request: CheckoutRequest):
         
         if result["status"] == "error":
             raise HTTPException(status_code=400, detail=result["message"])
+        if result["status"] == "manual_required":
+            return result
             
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/checkout/manual-handoff/complete")
+async def complete_manual_handoff(request: ManualHandoffCompleteRequest):
+    """人工完成 hCaptcha 后，回传 token 给服务端继续支付流程。"""
+    _cleanup_expired_handoffs()
+    handoff = manual_handoff_store.get(request.handoff_id)
+    if not handoff:
+        raise HTTPException(status_code=404, detail="handoff_id 不存在或已过期，请重新发起 checkout")
+    if not request.captcha_token.strip():
+        raise HTTPException(status_code=400, detail="captcha_token 不能为空")
+
+    checkout_payload = dict(handoff["checkout_request"])
+    checkout_payload["captcha_token"] = request.captcha_token.strip()
+    req = CheckoutRequest(**checkout_payload)
+    manual_handoff_store.pop(request.handoff_id, None)
+
+    result = await asyncio.to_thread(run_checkout_sync, req)
+    if result["status"] == "error":
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@app.post("/api/v1/checkout/manual-handoff/status")
+async def check_manual_handoff_status(request: ManualHandoffStatusRequest):
+    """
+    检查人工接管状态：
+    - completed: 人工已在 Stripe 页面完成支付/认证
+    - pending: 尚未完成，继续等待或使用 token 回传
+    """
+    _cleanup_expired_handoffs()
+    handoff = manual_handoff_store.get(request.handoff_id)
+    if not handoff:
+        raise HTTPException(status_code=404, detail="handoff_id 不存在或已过期，请重新发起 checkout")
+
+    try:
+        result = await asyncio.to_thread(_check_handoff_payment_status, handoff)
+        # poll_result 返回结构可能因页面状态不同而变化，这里尽量宽松判断
+        if result:
+            status_text = json.dumps(result, ensure_ascii=False).lower()
+            success_keywords = ["succeeded", "complete", "paid", "success"]
+            if any(keyword in status_text for keyword in success_keywords):
+                manual_handoff_store.pop(request.handoff_id, None)
+                return {"status": "completed", "data": result}
+        return {"status": "pending", "message": "尚未检测到人工完成结果，请继续认证或稍后重试。"}
+    except Exception as e:
+        return {"status": "pending", "message": f"暂未完成或检测失败: {e}"}
 
 if __name__ == "__main__":
     import uvicorn
