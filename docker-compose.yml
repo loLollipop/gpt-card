@@ -6,5 +6,15 @@ services:
     ports:
       - "8888:8888"
     restart: always
+    env_file:
+      - .env
     environment:
       - TZ=Asia/Shanghai
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8888
+      - MANUAL_HANDOFF_TTL_SECONDS=900
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8888/healthz', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
